@@ -26,8 +26,10 @@
 #include "hy-subject.h"
 #include "hy-subject-private.h"
 #include "hy-nevra.h"
+#include "hy-module-form.h"
 #include "hy-iutil.h"
 #include "hy-nevra-private.h"
+#include "hy-module-form-private.h"
 #include "hy-types.h"
 #include "hy-query.h"
 #include "hy-selector.h"
@@ -35,6 +37,25 @@
 // most specific to least
 const HyForm HY_FORMS_MOST_SPEC[] = {
     HY_FORM_NEVRA, HY_FORM_NA, HY_FORM_NAME, HY_FORM_NEVR, HY_FORM_NEV, _HY_FORM_STOP_ };
+
+const HyModuleFormE HY_MODULE_FORMS_MOST_SPEC[] = {
+        HY_MODULE_FORM_NSVCAP,
+        HY_MODULE_FORM_NSVCA,
+        HY_MODULE_FORM_NSVAP,
+        HY_MODULE_FORM_NSVA,
+        HY_MODULE_FORM_NSAP,
+        HY_MODULE_FORM_NSA,
+        HY_MODULE_FORM_NSVCP,
+        HY_MODULE_FORM_NSVP,
+        HY_MODULE_FORM_NSVC,
+        HY_MODULE_FORM_NSV,
+        HY_MODULE_FORM_NSP,
+        HY_MODULE_FORM_NS,
+        HY_MODULE_FORM_NAP,
+        HY_MODULE_FORM_NA,
+        HY_MODULE_FORM_NP,
+        HY_MODULE_FORM_N,
+        _HY_MODULE_FORM_STOP_};
 
 static inline int
 is_glob_pattern(char *str)
@@ -50,18 +71,15 @@ is_glob_pattern(char *str)
 }
 
 static inline int
-is_real_name(HyNevra nevra, DnfSack *sack, int flags)
+is_real_name(char* name, char* version, DnfSack *sack, int flags)
 {
     flags |= HY_NAME_ONLY;
-    int glob_version = (flags & HY_GLOB) && is_glob_pattern(nevra->version);
-    char *version = nevra->version;
-    if (nevra->name == NULL && !glob_version)
+    int glob_version = (flags & HY_GLOB) && is_glob_pattern(version);
+    if (name == NULL && !glob_version)
         return 1;
-    if (glob_version)
-        version = NULL;
-    if (!is_glob_pattern(nevra->name))
+    if (!is_glob_pattern(name))
         flags &= ~HY_GLOB;
-    if (dnf_sack_knows(sack, nevra->name, version, flags) == 0)
+    if (dnf_sack_knows(sack, name, glob_version ? NULL : version, flags) == 0)
         return 0;
     return 1;
 }
@@ -80,17 +98,17 @@ arch_exist(char *arch, const char *existing_arch, int is_glob)
 }
 
 static inline int
-is_real_arch(HyNevra nevra, DnfSack *sack, int flags)
+is_real_arch(char* arch, DnfSack *sack, int flags)
 {
-    int check_glob = (flags & HY_GLOB) && is_glob_pattern(nevra->arch);
-    if (nevra->arch == NULL)
+    int check_glob = (flags & HY_GLOB) && is_glob_pattern(arch);
+    if (arch == NULL)
         return 1;
-    if (arch_exist(nevra->arch, "src", check_glob))
+    if (arch_exist(arch, "src", check_glob))
         return 1;
     const char **existing_arches = dnf_sack_list_arches(sack);
     int ret = 0;
     for (int i = 0; existing_arches[i] != NULL; ++i) {
-        if ((ret = arch_exist(nevra->arch, existing_arches[i], check_glob)))
+        if ((ret = arch_exist(arch, existing_arches[i], check_glob)))
             break;
     }
     g_free(existing_arches);
@@ -100,8 +118,15 @@ is_real_arch(HyNevra nevra, DnfSack *sack, int flags)
 static inline int
 filter_real(HyNevra nevra, DnfSack *sack, int flags)
 {
-    return is_real_name(nevra, sack, flags) &&
-        is_real_arch(nevra, sack, flags);
+    return is_real_name(nevra->name, nevra->version, sack, flags) &&
+        is_real_arch(nevra->arch, sack, flags);
+}
+
+static inline int
+mod_filter_real(HyModuleForm module_form, DnfSack *sack, int flags)
+{
+    return is_real_name(module_form->name, NULL, sack, flags) &&
+           is_real_arch(module_form->arch, sack, flags);
 }
 
 HySubject
@@ -121,6 +146,7 @@ hy_possibilities_free(HyPossibilities iter)
 {
     g_free(iter->subject);
     g_free(iter->forms);
+    g_free(iter->module_forms);
     g_free(iter);
 }
 
@@ -141,17 +167,35 @@ forms_dup(const HyForm *forms)
     return res;
 }
 
+static HyModuleFormE *
+module_forms_dup(const HyModuleFormE *forms)
+{
+    if (forms == NULL)
+        return NULL;
+    HyModuleFormE *res = NULL;
+    const int BLOCK_SIZE = 17;
+    HyModuleFormE form;
+    int i = 0;
+    do {
+        res = solv_extend(res, i, 1, sizeof(HyModuleFormE), BLOCK_SIZE);
+        form = forms[i];
+        res[i++] = form;
+    } while (form != _HY_MODULE_FORM_STOP_);
+    return res;
+}
+
 static HyPossibilities
-possibilities_create(HySubject subject, const HyForm *forms, DnfSack *sack, int flags,
-    enum poss_type type)
+possibilities_create(HySubject subject, const HyForm *forms, const HyModuleFormE *module_forms, DnfSack *sack,
+                     int flags, enum poss_type type)
 {
     HyPossibilities poss = g_malloc0(sizeof(*poss));
     poss->subject = hy_subject_create(subject);
     poss->forms = forms_dup(forms);
+    poss->module_forms = module_forms_dup(module_forms);
     poss->sack = sack;
     poss->flags = flags;
     poss->type = type;
-    if (forms == NULL)
+    if (forms == NULL && module_forms == NULL)
         poss->current = -1;
     else
         poss->current = 0;
@@ -161,7 +205,7 @@ possibilities_create(HySubject subject, const HyForm *forms, DnfSack *sack, int 
 HyPossibilities
 hy_subject_reldep_possibilities_real(HySubject subject, DnfSack *sack, int flags)
 {
-    return possibilities_create(subject, NULL, sack, flags, TYPE_RELDEP_NEW);
+    return possibilities_create(subject, NULL, NULL, sack, flags, TYPE_RELDEP_NEW);
 }
 
 int hy_possibilities_next_reldep(HyPossibilities iter, DnfReldep **out_reldep)
@@ -188,7 +232,7 @@ HyPossibilities
 hy_subject_nevra_possibilities(HySubject subject, HyForm *forms)
 {
     const HyForm *default_forms = forms == NULL ? HY_FORMS_MOST_SPEC : forms;
-    return possibilities_create(subject, default_forms, NULL, 0, TYPE_NEVRA);
+    return possibilities_create(subject, default_forms, NULL, NULL, 0, TYPE_NEVRA);
 }
 
 HyPossibilities
@@ -196,7 +240,14 @@ hy_subject_nevra_possibilities_real(HySubject subject, HyForm *forms,
     DnfSack *sack, int flags)
 {
     const HyForm *default_forms = forms == NULL ? HY_FORMS_MOST_SPEC : forms;
-    return possibilities_create(subject, default_forms, sack, flags, TYPE_NEVRA);
+    return possibilities_create(subject, default_forms, NULL, sack, flags, TYPE_NEVRA);
+}
+
+HyPossibilities
+hy_subject_module_form_possibilities(HySubject subject, HyModuleFormE *forms)
+{
+    const HyModuleFormE *default_forms = forms == NULL ? HY_MODULE_FORMS_MOST_SPEC : forms;
+    return possibilities_create(subject, NULL, default_forms, NULL, 0, TYPE_MODULE_FORM);
 }
 
 int
@@ -216,6 +267,27 @@ hy_possibilities_next_nevra(HyPossibilities iter, HyNevra *out_nevra)
         }
         form = iter->forms[iter->current];
         g_clear_pointer(out_nevra, hy_nevra_free);
+    }
+    return -1;
+}
+
+int
+hy_possibilities_next_module_form(HyPossibilities iter, HyModuleForm *out_module_form)
+{
+    if (iter->type != TYPE_MODULE_FORM || iter->current == -1)
+        return -1;
+    HyModuleFormE form = iter->module_forms[iter->current];
+    while (form != _HY_MODULE_FORM_STOP_) {
+        iter->current++;
+        *out_module_form = hy_module_form_create();
+        if (module_form_possibility(iter->subject, form, *out_module_form) == 0) {
+            if (iter->sack == NULL)
+                return 0;
+            if (mod_filter_real(*out_module_form, iter->sack, iter->flags))
+                return 0;
+        }
+        form = iter->module_forms[iter->current];
+        g_clear_pointer(out_module_form, hy_module_form_free);
     }
     return -1;
 }
